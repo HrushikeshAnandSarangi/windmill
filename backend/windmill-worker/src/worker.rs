@@ -1419,6 +1419,7 @@ fn start_interactive_worker_shell(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut occupancy_metrics = OccupancyMetrics::new(Instant::now());
+        let mut job_buffer: Vec<PulledJobResult> = Vec::new();
 
         let mut last_executed_job: Option<Instant> =
             Instant::now().checked_sub(Duration::from_millis(2500));
@@ -1437,20 +1438,40 @@ fn start_interactive_worker_shell(
                 result = async {
                     match &conn {
                         Connection::Sql(db) => {
-                            let common_worker_prefix = retrieve_common_worker_prefix(&worker_name);
-                            let query = ("".to_string(), make_pull_query(&[common_worker_prefix]));
-                            #[cfg(feature = "benchmark")]
-                            let mut bench = windmill_common::bench::BenchmarkIter::new();
-
-                            let job = pull(
-                                &db,
-                                false,
-                                &worker_name,
-                                Some(&query),
+                            let job = if let Some(j) = job_buffer.pop() {
+                                Ok(j)
+                            } else {
+                                let common_worker_prefix = retrieve_common_worker_prefix(&worker_name);
+                                let query = ("".to_string(), make_pull_query(&[common_worker_prefix]));
                                 #[cfg(feature = "benchmark")]
-                                &mut bench,
-                            )
-                            .await;
+                                let mut bench = windmill_common::bench::BenchmarkIter::new();
+
+                                match pull_batch(
+                                    &db,
+                                    false,
+                                    &worker_name,
+                                    Some(&query),
+                                    #[cfg(feature = "benchmark")]
+                                    &mut bench,
+                                )
+                                .await {
+                                    Ok(mut js) => {
+                                        if let Some(j) = js.pop() {
+                                            job_buffer = js;
+                                            Ok(j)
+                                        } else {
+                                            tracing::error!("pull_batch returned OK but an empty vector, setting job: None");
+                                            Ok(PulledJobResult {
+                                                job: None,
+                                                suspended: false,
+                                                missing_concurrency_key: false,
+                                                error_while_preprocessing: None,
+                                            })
+                                        }
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            };
 
                             use PulledJobResultToJobErr::*;
                             match job {
@@ -2062,6 +2083,7 @@ pub async fn run_worker(
     let mut last_30jobs_suspended = 0;
     let mut last_suspend_first = Instant::now();
     let mut killed_but_draining_same_worker_jobs = false;
+    let mut job_buffer: Vec<PulledJobResult> = Vec::new();
 
     let mut killpill_rx2 = killpill_rx.resubscribe();
 
@@ -2321,25 +2343,44 @@ pub async fn run_worker(
                         if suspend_first {
                             last_suspend_first = Instant::now();
                         }
-                        let mut job = match timeout(
-                            Duration::from_secs(30),
-                            pull(
-                                &db,
-                                suspend_first,
-                                &worker_name,
-                                None,
-                                #[cfg(feature = "benchmark")]
-                                &mut bench,
+
+                        let mut job = if let Some(j) = job_buffer.pop() {
+                            Ok(j)
+                        } else {
+                            match timeout(
+                                Duration::from_secs(30),
+                                pull_batch(
+                                    &db,
+                                    suspend_first,
+                                    &worker_name,
+                                    None,
+                                    #[cfg(feature = "benchmark")]
+                                    &mut bench,
+                                )
+                                .warn_after_seconds(2),
                             )
-                            .warn_after_seconds(2),
-                        )
-                        .await
-                        {
-                            Ok(job) => job,
-                            Err(e) => {
-                                tracing::error!(worker = %worker_name, hostname = %hostname, "pull timed out after 20s, sleeping for 30s: {e:?}");
-                                tokio::time::sleep(Duration::from_secs(30)).await;
-                                continue;
+                            .await
+                            {
+                                Ok(Ok(mut jobs)) => {
+                                    if jobs.is_empty() {
+                                        Ok(PulledJobResult {
+                                            job: None,
+                                            suspended: false,
+                                            missing_concurrency_key: false,
+                                            error_while_preprocessing: None,
+                                        })
+                                    } else {
+                                        let j = jobs.pop().unwrap();
+                                        job_buffer.extend(jobs);
+                                        Ok(j)
+                                    }
+                                }
+                                Ok(Err(e)) => Err(e),
+                                Err(e) => {
+                                    tracing::error!(worker = %worker_name, hostname = %hostname, "pull timed out after 20s, sleeping for 30s: {e:?}");
+                                    tokio::time::sleep(Duration::from_secs(30)).await;
+                                    continue;
+                                }
                             }
                         };
 
