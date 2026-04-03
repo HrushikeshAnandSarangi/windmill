@@ -95,10 +95,11 @@ use windmill_common::{
 };
 
 use windmill_queue::{
-    append_logs, canceled_job_to_result, empty_result, get_same_worker_job, pull, push_init_job,
+    append_logs, canceled_job_to_result, empty_result, get_same_worker_job, push_init_job,
     push_periodic_bash_job, CanceledBy, JobAndPerms, JobCompleted, MiniPulledJob,
     PrecomputedAgentInfo, PulledJob, SameWorkerPayload, HTTP_CLIENT, INIT_SCRIPT_TAG,
     PERIODIC_SCRIPT_TAG,
+    pull_batch, PulledJobResult,
 };
 
 #[cfg(feature = "prometheus")]
