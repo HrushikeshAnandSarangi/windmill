@@ -27,7 +27,7 @@ use windmill_common::otel_oss::{
 };
 use windmill_common::runtime_assets::init_runtime_asset_loop;
 use windmill_common::runtime_assets::register_runtime_asset;
-use windmill_queue::{pull, pull_batch, PulledJobResult};
+
 use windmill_common::scripts::hash_to_codebase_id;
 use windmill_common::scripts::is_special_codebase_hash;
 use windmill_common::scripts::ScriptModule;
@@ -95,11 +95,10 @@ use windmill_common::{
 };
 
 use windmill_queue::{
-    append_logs, canceled_job_to_result, empty_result, get_same_worker_job, push_init_job,
-    push_periodic_bash_job, CanceledBy, JobAndPerms, JobCompleted, MiniPulledJob,
-    PrecomputedAgentInfo, PulledJob, SameWorkerPayload, HTTP_CLIENT, INIT_SCRIPT_TAG,
-    PERIODIC_SCRIPT_TAG,
-    pull_batch, PulledJobResult,
+    append_logs, canceled_job_to_result, empty_result, get_same_worker_job, pull_batch,
+    push_init_job, push_periodic_bash_job, CanceledBy, JobAndPerms, JobCompleted, MiniPulledJob,
+    PrecomputedAgentInfo, PulledJob, PulledJobResult, SameWorkerPayload, HTTP_CLIENT,
+    INIT_SCRIPT_TAG, PERIODIC_SCRIPT_TAG,
 };
 
 #[cfg(feature = "prometheus")]
@@ -5498,4 +5497,3 @@ pub fn get_worker_internal_server_inline_utils(
         )),
     }
 }
-
