@@ -1461,7 +1461,7 @@ fn start_interactive_worker_shell(
                                             job_buffer = js;
                                             Ok(j)
                                         } else {
-                                            tracing::error!("pull_batch returned OK but an empty vector, setting job: None");
+                                            tracing::trace!("pull_batch returned OK but an empty vector");
                                             Ok(PulledJobResult {
                                                 job: None,
                                                 suspended: false,

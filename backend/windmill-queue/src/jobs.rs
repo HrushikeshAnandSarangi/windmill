@@ -814,6 +814,38 @@ lazy_static::lazy_static! {
 
 const WORKSPACE_HANDLER_CACHE_TTL_SECONDS: i64 = 60;
 
+pub async fn add_completed_noop_batch(db: &Pool<Postgres>, job_ids: Vec<Uuid>) -> Result<()> {
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = db.begin().await?;
+
+    sqlx::query!(
+        r#"
+        WITH deleted AS (
+            DELETE FROM v2_job_queue 
+            WHERE id = ANY($1)
+            RETURNING id
+        )
+        INSERT INTO v2_job_completed 
+            (id, workspace_id, started_at, duration_ms, result, status)
+        SELECT deleted.id, q.workspace_id, now(), 0, 'null'::jsonb, 'success'::job_status
+        FROM deleted
+        JOIN v2_job_queue q ON q.id = deleted.id
+        ON CONFLICT (id) DO UPDATE SET status = 'success'::job_status
+        "#,
+        &job_ids
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::debug!("batch committed {} noop jobs", job_ids.len());
+    Ok(())
+}
+
 pub async fn add_completed_job<T: Serialize + Send + Sync + ValidableJson>(
     db: &Pool<Postgres>,
     completed_job: &MiniCompletedJob,

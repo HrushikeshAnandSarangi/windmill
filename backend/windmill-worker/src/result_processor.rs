@@ -43,7 +43,7 @@ use serde_json::{json, value::RawValue, Value};
 
 use tokio::{sync::Notify, task::JoinHandle};
 
-use windmill_queue::{add_completed_job, add_completed_job_error};
+use windmill_queue::{add_completed_job, add_completed_job_error, add_completed_noop_batch};
 
 use crate::{
     bash_executor::ANSI_ESCAPE_RE,
@@ -59,6 +59,39 @@ use windmill_common::client::AuthedClient;
 struct ErrorMessage {
     message: String,
     name: String,
+}
+
+struct NoopBatch {
+    job_ids: Vec<Uuid>,
+    last_commit: std::time::Instant,
+}
+
+impl NoopBatch {
+    const MAX_SIZE: usize = 100;
+    const TIMEOUT_MS: u64 = 5;
+
+    fn new() -> Self {
+        Self { job_ids: Vec::with_capacity(100), last_commit: std::time::Instant::now() }
+    }
+
+    fn add(&mut self, id: Uuid) {
+        self.job_ids.push(id);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.job_ids.len() >= Self::MAX_SIZE
+            || self.last_commit.elapsed() > std::time::Duration::from_millis(Self::TIMEOUT_MS)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.job_ids.is_empty()
+    }
+
+    fn drain(&mut self) -> Vec<Uuid> {
+        let ids: Vec<Uuid> = self.job_ids.drain(..).collect();
+        self.last_commit = std::time::Instant::now();
+        ids
+    }
 }
 
 async fn process_jc(
@@ -220,6 +253,8 @@ pub fn start_background_processor(
 
         let JobCompletedReceiver { bounded_rx, mut killpill_rx, unbounded_rx } = job_completed_rx;
 
+        let mut noop_batch = NoopBatch::new();
+
         #[cfg(feature = "benchmark")]
         let mut infos = BenchmarkInfo::new(windmill_common::bench::shared_bench_iters());
 
@@ -244,6 +279,17 @@ pub fn start_background_processor(
                 }
             }
         });
+
+        // Flush noop batch helper
+        let flush_noop_batch = |batch: &mut NoopBatch, db: &DB| async {
+            if batch.is_empty() {
+                return;
+            }
+            let ids = batch.drain();
+            if let Err(e) = add_completed_noop_batch(db, ids).await {
+                tracing::error!("noop batch commit failed: {}", e);
+            }
+        };
 
         //if we have been killed, we want to drain the queue of jobs
         while let Some(sr) = {
@@ -276,6 +322,9 @@ pub fn start_background_processor(
                 }
             }
         } {
+            // Flush noop batch before processing next message
+            flush_noop_batch(&mut noop_batch, &db).await;
+
             #[cfg(feature = "benchmark")]
             let mut bench = BenchmarkIter::new();
 
@@ -284,6 +333,12 @@ pub fn start_background_processor(
                     result: SendResultPayload::JobCompleted(jc),
                     time,
                 }) => {
+                    // Buffer noop jobs for batch commit
+                    if matches!(jc.job.kind, JobKind::Noop) {
+                        noop_batch.add(jc.job.id);
+                        continue;
+                    }
+
                     let is_init_script_and_failure =
                         !jc.success && jc.job.tag.as_str() == INIT_SCRIPT_TAG;
                     let is_dependency_job = matches!(
@@ -401,6 +456,9 @@ pub fn start_background_processor(
                 JobCompletedRx::WakeUp => {}
             }
         }
+
+        // Flush remaining noop jobs before shutting down
+        flush_noop_batch(&mut noop_batch, &db).await;
 
         // Flush any remaining stats before shutting down
         tracing::info!("flushing remaining stats before shutting down");
