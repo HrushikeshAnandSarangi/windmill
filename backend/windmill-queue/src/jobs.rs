@@ -814,7 +814,10 @@ lazy_static::lazy_static! {
 
 const WORKSPACE_HANDLER_CACHE_TTL_SECONDS: i64 = 60;
 
-pub async fn add_completed_noop_batch(db: &Pool<Postgres>, job_ids: Vec<Uuid>) -> Result<()> {
+pub async fn add_completed_noop_batch(
+    db: &Pool<Postgres>,
+    job_ids: Vec<Uuid>,
+) -> Result<(), Error> {
     if job_ids.is_empty() {
         return Ok(());
     }
