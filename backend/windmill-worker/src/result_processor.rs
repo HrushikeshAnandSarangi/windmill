@@ -280,16 +280,17 @@ pub fn start_background_processor(
             }
         });
 
-        // Flush noop batch helper
-        let flush_noop_batch = |batch: &mut NoopBatch, db: &DB| async {
-            if batch.is_empty() {
-                return;
-            }
-            let ids = batch.drain();
-            if let Err(e) = add_completed_noop_batch(db, ids).await {
-                tracing::error!("noop batch commit failed: {}", e);
-            }
-        };
+        // Helper macro to flush noop batch
+        macro_rules! flush_noop_batch {
+            () => {
+                if !noop_batch.is_empty() {
+                    let ids = noop_batch.drain();
+                    if let Err(e) = add_completed_noop_batch(&db, ids).await {
+                        tracing::error!("noop batch commit failed: {}", e);
+                    }
+                }
+            };
+        }
 
         //if we have been killed, we want to drain the queue of jobs
         while let Some(sr) = {
@@ -323,7 +324,7 @@ pub fn start_background_processor(
             }
         } {
             // Flush noop batch before processing next message
-            flush_noop_batch(&mut noop_batch, &db).await;
+            flush_noop_batch!();
 
             #[cfg(feature = "benchmark")]
             let mut bench = BenchmarkIter::new();
@@ -458,7 +459,7 @@ pub fn start_background_processor(
         }
 
         // Flush remaining noop jobs before shutting down
-        flush_noop_batch(&mut noop_batch, &db).await;
+        flush_noop_batch!();
 
         // Flush any remaining stats before shutting down
         tracing::info!("flushing remaining stats before shutting down");
