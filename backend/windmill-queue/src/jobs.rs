@@ -915,6 +915,38 @@ async fn commit_completed_job<T: Serialize + Send + Sync + ValidableJson>(
 
     let mut tx = db.begin().warn_after_seconds(10).await?;
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // HOT PATH: Noop jobs bypass all complex logic - single query completion
+    // ═══════════════════════════════════════════════════════════════════════
+    if matches!(completed_job.kind, JobKind::Noop) {
+        let duration = sqlx::query_scalar!(
+            "WITH q AS (
+                DELETE FROM v2_job_queue WHERE id = $1 RETURNING workspace_id
+            )
+            INSERT INTO v2_job_completed 
+                (id, workspace_id, started_at, duration_ms, result, status)
+            SELECT $1, q.workspace_id, now(), 0, 'null'::jsonb, 'success'::job_status
+            FROM q
+            ON CONFLICT (id) DO UPDATE SET status = 'success'::job_status
+            RETURNING duration_ms AS \"duration_ms!\"",
+            completed_job.id
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            Error::internal_err(format!(
+                "Could not complete noop job {}: {}",
+                completed_job.id, e
+            ))
+        })?;
+
+        tx.commit().warn_after_seconds(10).await?;
+
+        tracing::debug!("noop job {} completed", completed_job.id);
+        return Ok((None, duration.unwrap_or(0), false, None));
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+
     let job_id = completed_job.id;
     // tracing::error!("1 {:?}", start.elapsed());
 
@@ -3316,13 +3348,18 @@ pub async fn pull_batch(
                     )
                     .await?
                     .1
-                    .maybe_fallback(None, job.concurrent_limit, job.concurrency_time_window_s)
+                    .maybe_fallback(
+                        None,
+                        job.concurrent_limit,
+                        job.concurrency_time_window_s,
+                    )
                 };
 
                 let pulled_job_result = match job {
                     #[cfg(feature = "private")]
                     job if concurrency_settings.concurrent_limit.is_some()
-                        && (cfg!(feature = "enterprise") || (job.is_dependency() && !*WMDEBUG_NO_DEBOUNCING)) =>
+                        && (cfg!(feature = "enterprise")
+                            || (job.is_dependency() && !*WMDEBUG_NO_DEBOUNCING)) =>
                     {
                         timeout(
                             Duration::from_secs(15),
