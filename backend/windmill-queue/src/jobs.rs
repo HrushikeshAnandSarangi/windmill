@@ -816,7 +816,7 @@ lazy_static::lazy_static! {
 const WORKSPACE_HANDLER_CACHE_TTL_SECONDS: i64 = 60;
 
 struct NoopBatch {
-    job_ids: Vec<Uuid>,
+    jobs: Vec<(Uuid, String)>, // (job_id, workspace_id)
     last_flush: Instant,
 }
 
@@ -825,65 +825,63 @@ impl NoopBatch {
     const TIMEOUT_MS: u64 = 12;
 
     fn should_flush(&self) -> bool {
-        self.job_ids.len() >= Self::MAX_SIZE
+        self.jobs.len() >= Self::MAX_SIZE
             || self.last_flush.elapsed() > Duration::from_millis(Self::TIMEOUT_MS)
     }
 }
 
 static NOOP_BATCH: LazyLock<tokio::sync::Mutex<NoopBatch>> = LazyLock::new(|| {
     tokio::sync::Mutex::new(NoopBatch {
-        job_ids: Vec::with_capacity(2048),
+        jobs: Vec::with_capacity(2048),
         last_flush: Instant::now(),
     })
 });
 
-pub async fn add_completed_noop_batch(
+pub async fn add_completed_noop_insert(
     db: &Pool<Postgres>,
-    job_ids: Vec<Uuid>,
+    jobs: Vec<(Uuid, String)>,
 ) -> Result<(), Error> {
-    if job_ids.is_empty() {
+    if jobs.is_empty() {
         return Ok(());
     }
 
     let mut tx = db.begin().await?;
 
+    let job_ids: Vec<Uuid> = jobs.iter().map(|(id, _)| *id).collect();
+    let workspace_ids: Vec<String> = jobs.iter().map(|(_, w)| w.clone()).collect();
+
     sqlx::query!(
         r#"
-        WITH deleted AS (
-            DELETE FROM v2_job_queue 
-            WHERE id = ANY($1)
-            RETURNING id
-        )
         INSERT INTO v2_job_completed 
             (id, workspace_id, started_at, duration_ms, result, status)
-        SELECT deleted.id, q.workspace_id, now(), 0, 'null'::jsonb, 'success'::job_status
-        FROM deleted
-        JOIN v2_job_queue q ON q.id = deleted.id
+        SELECT id, workspace_id, now(), 0, 'null'::jsonb, 'success'::job_status
+        FROM UNNEST($1::uuid[], $2::text[]) AS t(id, workspace_id)
         ON CONFLICT (id) DO UPDATE SET status = 'success'::job_status
         "#,
-        &job_ids
+        &job_ids,
+        &workspace_ids
     )
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
 
-    tracing::debug!("batch committed {} noop jobs", job_ids.len());
+    tracing::debug!("batch inserted {} noop jobs", jobs.len());
     Ok(())
 }
 
 pub async fn flush_noop_batches(db: &Pool<Postgres>) {
-    let ids = {
+    let jobs = {
         let mut batch = NOOP_BATCH.lock().await;
-        if batch.job_ids.is_empty() {
+        if batch.jobs.is_empty() {
             return;
         }
-        let ids: Vec<Uuid> = batch.job_ids.drain(..).collect();
+        let jobs: Vec<(Uuid, String)> = batch.jobs.drain(..).collect();
         batch.last_flush = Instant::now();
-        ids
+        jobs
     };
 
-    if let Err(e) = add_completed_noop_batch(db, ids).await {
+    if let Err(e) = add_completed_noop_insert(db, jobs).await {
         tracing::error!("noop batch flush on shutdown failed: {}", e);
     }
 }
@@ -990,32 +988,41 @@ async fn commit_completed_job<T: Serialize + Send + Sync + ValidableJson>(
     let mut tx = db.begin().warn_after_seconds(10).await?;
 
     // ═══════════════════════════════════════════════════════════════════════
-    // HOT PATH: Noop jobs bypass all complex logic - batched commit
+    // HOT PATH: Noop jobs bypass all complex logic - immediate delete, batched insert
     // ═══════════════════════════════════════════════════════════════════════
     if matches!(completed_job.kind, JobKind::Noop) {
-        let db = db.clone();
         let job_id = completed_job.id;
+        let workspace_id = completed_job.workspace_id.clone();
 
-        // Add to batch
+        // Immediate DELETE from queue to prevent zombie job detection
+        sqlx::query!("DELETE FROM v2_job_queue WHERE id = $1", job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                Error::internal_err(format!("Could not delete noop job from queue: {}", e))
+            })?;
+
+        tx.commit().await?;
+
+        // Buffer for batch INSERT to v2_job_completed
+        let db = db.clone();
         {
             let mut batch = NOOP_BATCH.lock().await;
-            batch.job_ids.push(job_id);
+            batch.jobs.push((job_id, workspace_id));
 
-            // If batch is full or timed out, flush asynchronously
             if batch.should_flush() {
-                let ids: Vec<Uuid> = batch.job_ids.drain(..).collect();
+                let jobs: Vec<(Uuid, String)> = batch.jobs.drain(..).collect();
                 batch.last_flush = Instant::now();
                 drop(batch);
 
                 tokio::spawn(async move {
-                    if let Err(e) = add_completed_noop_batch(&db, ids).await {
-                        tracing::error!("noop batch commit failed: {}", e);
+                    if let Err(e) = add_completed_noop_insert(&db, jobs).await {
+                        tracing::error!("noop batch insert failed: {}", e);
                     }
                 });
             }
         }
 
-        tx.rollback().await.ok();
         return Ok((None, 0, false, None));
     }
     // ═══════════════════════════════════════════════════════════════════════
