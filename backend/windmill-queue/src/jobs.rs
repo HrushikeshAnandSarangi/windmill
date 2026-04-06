@@ -7,8 +7,9 @@
  */
 
 use std::future::Future;
-use std::time::Duration;
-use std::{collections::HashMap, sync::Arc, vec};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+use std::{sync::Arc, vec};
 
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -25,8 +26,8 @@ use serde::{ser::SerializeMap, Serialize};
 use serde_json::{json, value::RawValue};
 use sqlx::{types::Json, Acquire, Pool, Postgres, Transaction};
 use sqlx::{Encode, PgExecutor};
-use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use tokio::sync::{mpsc::Sender, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio::{sync::RwLock, time::sleep};
@@ -814,6 +815,28 @@ lazy_static::lazy_static! {
 
 const WORKSPACE_HANDLER_CACHE_TTL_SECONDS: i64 = 60;
 
+struct NoopBatch {
+    job_ids: Vec<Uuid>,
+    last_flush: Instant,
+}
+
+impl NoopBatch {
+    const MAX_SIZE: usize = 2048;
+    const TIMEOUT_MS: u64 = 12;
+
+    fn should_flush(&self) -> bool {
+        self.job_ids.len() >= Self::MAX_SIZE
+            || self.last_flush.elapsed() > Duration::from_millis(Self::TIMEOUT_MS)
+    }
+}
+
+static NOOP_BATCH: LazyLock<tokio::sync::Mutex<NoopBatch>> = LazyLock::new(|| {
+    tokio::sync::Mutex::new(NoopBatch {
+        job_ids: Vec::with_capacity(2048),
+        last_flush: Instant::now(),
+    })
+});
+
 pub async fn add_completed_noop_batch(
     db: &Pool<Postgres>,
     job_ids: Vec<Uuid>,
@@ -847,6 +870,22 @@ pub async fn add_completed_noop_batch(
 
     tracing::debug!("batch committed {} noop jobs", job_ids.len());
     Ok(())
+}
+
+pub async fn flush_noop_batches(db: &Pool<Postgres>) {
+    let ids = {
+        let mut batch = NOOP_BATCH.lock().await;
+        if batch.job_ids.is_empty() {
+            return;
+        }
+        let ids: Vec<Uuid> = batch.job_ids.drain(..).collect();
+        batch.last_flush = Instant::now();
+        ids
+    };
+
+    if let Err(e) = add_completed_noop_batch(db, ids).await {
+        tracing::error!("noop batch flush on shutdown failed: {}", e);
+    }
 }
 
 pub async fn add_completed_job<T: Serialize + Send + Sync + ValidableJson>(
@@ -951,34 +990,33 @@ async fn commit_completed_job<T: Serialize + Send + Sync + ValidableJson>(
     let mut tx = db.begin().warn_after_seconds(10).await?;
 
     // ═══════════════════════════════════════════════════════════════════════
-    // HOT PATH: Noop jobs bypass all complex logic - single query completion
+    // HOT PATH: Noop jobs bypass all complex logic - batched commit
     // ═══════════════════════════════════════════════════════════════════════
     if matches!(completed_job.kind, JobKind::Noop) {
-        let duration = sqlx::query_scalar!(
-            "WITH q AS (
-                DELETE FROM v2_job_queue WHERE id = $1 RETURNING workspace_id
-            )
-            INSERT INTO v2_job_completed 
-                (id, workspace_id, started_at, duration_ms, result, status)
-            SELECT $1, q.workspace_id, now(), 0, 'null'::jsonb, 'success'::job_status
-            FROM q
-            ON CONFLICT (id) DO UPDATE SET status = 'success'::job_status
-            RETURNING duration_ms AS \"duration_ms!\"",
-            completed_job.id
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| {
-            Error::internal_err(format!(
-                "Could not complete noop job {}: {}",
-                completed_job.id, e
-            ))
-        })?;
+        let db = db.clone();
+        let job_id = completed_job.id;
 
-        tx.commit().warn_after_seconds(10).await?;
+        // Add to batch
+        {
+            let mut batch = NOOP_BATCH.lock().await;
+            batch.job_ids.push(job_id);
 
-        tracing::debug!("noop job {} completed", completed_job.id);
-        return Ok((None, duration.unwrap_or(0), false, None));
+            // If batch is full or timed out, flush asynchronously
+            if batch.should_flush() {
+                let ids: Vec<Uuid> = batch.job_ids.drain(..).collect();
+                batch.last_flush = Instant::now();
+                drop(batch);
+
+                tokio::spawn(async move {
+                    if let Err(e) = add_completed_noop_batch(&db, ids).await {
+                        tracing::error!("noop batch commit failed: {}", e);
+                    }
+                });
+            }
+        }
+
+        tx.rollback().await.ok();
+        return Ok((None, 0, false, None));
     }
     // ═══════════════════════════════════════════════════════════════════════
 
